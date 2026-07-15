@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,6 +14,32 @@ import (
 var (
 	WSPort = "localhost:3223"
 )
+
+type MsgType string
+
+const (
+	MsgType_Broadcast MsgType = "broadcast"
+)
+
+type ReqMsg struct {
+	MsgType MsgType
+	Client  *Client
+	Data    string
+}
+
+type RespMsg struct {
+	MsgType  MsgType
+	Data     string
+	SenderID string
+}
+
+func NewRespMsg(msg *ReqMsg) *RespMsg {
+	return &RespMsg{
+		MsgType:  msg.MsgType,
+		Data:     msg.Data,
+		SenderID: msg.Client.ID,
+	}
+}
 
 type Client struct {
 	ID   string
@@ -29,19 +56,45 @@ func NewClient(conn *websocket.Conn) *Client {
 	}
 }
 
+func (c *Client) readMsgLoop(srv *Server) {
+	defer func() {
+		c.conn.Close()
+		srv.leaveServerCH <- c
+	}()
+
+	for {
+		_, b, err := c.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		msg := new(ReqMsg)
+		err = json.Unmarshal(b, msg)
+		if err != nil {
+			fmt.Printf("unable to unmarchal the msg %v\n", err)
+			continue
+		}
+		msg.Client = c
+
+		srv.broadcastCH <- msg
+	}
+}
+
 type Server struct {
-	clients      map[string]*Client
-	mu           *sync.RWMutex
-	joinServerCH chan *Client
-	leaveServeCH chan *Client
+	clients       map[string]*Client
+	mu            *sync.RWMutex
+	joinServerCH  chan *Client
+	leaveServerCH chan *Client
+	broadcastCH   chan *ReqMsg
 }
 
 func NewServer() *Server {
 	return &Server{
-		clients:      map[string]*Client{},
-		mu:           new(sync.RWMutex),
-		joinServerCH: make(chan *Client, 64),
-		leaveServeCH: make(chan *Client, 64),
+		clients:       map[string]*Client{},
+		mu:            new(sync.RWMutex),
+		joinServerCH:  make(chan *Client, 64),
+		leaveServerCH: make(chan *Client, 64),
+		broadcastCH:   make(chan *ReqMsg, 64),
 	}
 }
 
@@ -62,8 +115,8 @@ func (s *Server) handlerWS(w http.ResponseWriter, r *http.Request) {
 
 	client := NewClient(conn)
 	s.joinServerCH <- client
-	// add client
-	// read msg loop
+
+	go client.readMsgLoop(s)
 }
 
 func (s *Server) AcceptLoop() {
@@ -71,8 +124,10 @@ func (s *Server) AcceptLoop() {
 		select {
 		case c := <-s.joinServerCH:
 			s.joinServer(c)
-		case c := <-s.leaveServeCH:
+		case c := <-s.leaveServerCH:
 			s.leaveServer(c)
+		case msg := <-s.broadcastCH:
+			go s.broadcast(msg)
 		}
 	}
 }
@@ -85,6 +140,29 @@ func (s *Server) joinServer(c *Client) {
 func (s *Server) leaveServer(c *Client) {
 	delete(s.clients, c.ID)
 	fmt.Printf("client left the server, cID = %v\n", c.ID)
+}
+
+func (s *Server) broadcast(msg *ReqMsg) {
+
+	cls := []*Client{}
+
+	s.mu.RLock()
+	for _, c := range s.clients {
+		if c.ID != msg.Client.ID {
+			cls = append(cls, c)
+		}
+	}
+	s.mu.RUnlock()
+
+	resp := NewRespMsg(msg)
+	for _, c := range cls {
+		err := c.conn.WriteJSON(resp)
+		if err != nil {
+			fmt.Printf("error sending msg to clientID = %v\n", c.ID)
+			continue
+		}
+	}
+	fmt.Printf("broadcast we send")
 }
 
 func createWSServer() {
