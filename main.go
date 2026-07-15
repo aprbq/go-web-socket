@@ -2,10 +2,15 @@ package main
 
 import (
 	"crypto/rand"
+	"log"
 	"net/http"
 	"sync"
 
 	"github.com/gorilla/websocket"
+)
+
+var (
+	WSPort = ":3223"
 )
 
 type Client struct {
@@ -41,4 +46,6 @@ func handlerWS(r http.ResponseWriter, w *http.Request) {
 
 func main() {
 	http.HandleFunc("/", handlerWS)
+
+	log.Fatal(http.ListenAndServe(WSPort, nil))
 }
