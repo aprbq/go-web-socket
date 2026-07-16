@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -11,7 +12,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var host = "ws://"
+var (
+	host = "ws://"
+)
 
 type TestConfig struct {
 	clientCount    int
@@ -20,9 +23,37 @@ type TestConfig struct {
 	targetMsgCount int
 }
 
+type TestClient struct {
+	conn  *websocket.Conn
+	msgCH chan *ReqMsg
+	ctx   context.Context
+}
+
+func NewTestClient(conn *websocket.Conn, ctx context.Context) *TestClient {
+	return &TestClient{
+		conn:  conn,
+		msgCH: make(chan *ReqMsg, 64),
+		ctx:   ctx,
+	}
+}
+
+func (c *TestClient) writeLoop() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case msg := <-c.msgCH:
+			err := c.conn.WriteJSON(&msg)
+			if err != nil {
+				fmt.Printf("error sending msg %v\n", err)
+				return
+			}
+		}
+	}
+}
+
 func DialServer(tc *TestConfig) *websocket.Conn {
 	exit := make(chan struct{})
-
 	dialer := websocket.DefaultDialer
 
 	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSPort), nil)
@@ -38,7 +69,6 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 				return
 			}
 		}
-
 	}()
 
 	go func() {
@@ -47,13 +77,10 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 		tc.wg.Done()
 	}()
 
-	time.Sleep(2 * time.Second)
-
 	go func() {
 		for {
 			_, b, err := conn.ReadMessage()
 			if err != nil {
-				// close(exit)
 				return
 			}
 
@@ -66,11 +93,11 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 }
 
 func TestConnection(t *testing.T) {
-
 	go createWSServer()
+	ctx, cancel := context.WithCancel(context.Background())
 	time.Sleep(1 * time.Second)
-	clientCount := 5
-	brCount := 3
+	clientCount := 400
+	brCount := 50
 
 	tc := TestConfig{
 		clientCount:    clientCount,
@@ -78,36 +105,28 @@ func TestConnection(t *testing.T) {
 		brMsgCount:     new(atomic.Int64),
 		targetMsgCount: clientCount * brCount,
 	}
-
 	tc.wg.Add(tc.clientCount + 1)
 
-	brClient := DialServer(&tc)
+	brConn := DialServer(&tc)
+	brClient := NewTestClient(brConn, ctx)
+	go brClient.writeLoop()
 
 	for range tc.clientCount {
 		go DialServer(&tc)
 	}
-
 	time.Sleep(1 * time.Second)
 
 	for range brCount {
 		msg := ReqMsg{
 			MsgType: MsgType_Broadcast,
-			Data:    "hello from test",
+			Data:    "hello from tests",
 		}
-		time.Sleep(100 * time.Millisecond)
-
-		// go func() {
-		err := brClient.WriteJSON(&msg)
-		if err != nil {
-			fmt.Printf("error sending msg %v", err)
-			return
-		}
-		// }()
+		brClient.msgCH <- &msg
 	}
 
 	tc.wg.Wait()
+	cancel()
 
 	time.Sleep(1 * time.Second)
 	fmt.Println("exiting test")
-
 }
