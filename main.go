@@ -42,23 +42,43 @@ func NewRespMsg(msg *ReqMsg) *RespMsg {
 }
 
 type Client struct {
-	ID   string
-	mu   *sync.RWMutex
-	conn *websocket.Conn
+	ID    string
+	mu    *sync.RWMutex
+	conn  *websocket.Conn
+	msgCH chan *RespMsg
+	done  chan struct{}
 }
 
 func NewClient(conn *websocket.Conn) *Client {
 	ID := rand.Text()[:9]
 	return &Client{
-		ID:   ID,
-		mu:   new(sync.RWMutex),
-		conn: conn,
+		ID:    ID,
+		mu:    new(sync.RWMutex),
+		conn:  conn,
+		msgCH: make(chan *RespMsg, 64),
+		done:  make(chan struct{}),
+	}
+}
+
+func (c *Client) writeMsgLoop() {
+	defer c.conn.Close()
+	for {
+		select {
+		case <-c.done:
+			return
+		case msg := <-c.msgCH:
+			err := c.conn.WriteJSON(msg)
+			if err != nil {
+				fmt.Printf("error sending msg to clientID = %v\n", c.ID)
+				return
+			}
+		}
 	}
 }
 
 func (c *Client) readMsgLoop(srv *Server) {
 	defer func() {
-		c.conn.Close()
+		close(c.done)
 		srv.leaveServerCH <- c
 	}()
 
@@ -116,6 +136,7 @@ func (s *Server) handlerWS(w http.ResponseWriter, r *http.Request) {
 	client := NewClient(conn)
 	s.joinServerCH <- client
 
+	go client.writeMsgLoop()
 	go client.readMsgLoop(s)
 }
 
@@ -127,7 +148,13 @@ func (s *Server) AcceptLoop() {
 		case c := <-s.leaveServerCH:
 			s.leaveServer(c)
 		case msg := <-s.broadcastCH:
-			go s.broadcast(msg)
+			cls := map[string]*Client{}
+			for id, c := range s.clients {
+				if id != msg.Client.ID {
+					cls[id] = c
+				}
+			}
+			go s.broadcast(msg, cls)
 		}
 	}
 }
@@ -142,27 +169,13 @@ func (s *Server) leaveServer(c *Client) {
 	fmt.Printf("client left the server, cID = %v\n", c.ID)
 }
 
-func (s *Server) broadcast(msg *ReqMsg) {
-
-	cls := []*Client{}
-
-	s.mu.RLock()
-	for _, c := range s.clients {
-		if c.ID != msg.Client.ID {
-			cls = append(cls, c)
-		}
-	}
-	s.mu.RUnlock()
-
+func (s *Server) broadcast(msg *ReqMsg, cls map[string]*Client) {
 	resp := NewRespMsg(msg)
+
 	for _, c := range cls {
-		err := c.conn.WriteJSON(resp)
-		if err != nil {
-			fmt.Printf("error sending msg to clientID = %v\n", c.ID)
-			continue
-		}
+		c.msgCH <- resp
 	}
-	fmt.Printf("broadcast we send")
+	fmt.Printf("broadcast we send\n")
 }
 
 func createWSServer() {
