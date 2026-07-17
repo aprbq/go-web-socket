@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aprbq/go-web-socket/config"
+	"github.com/aprbq/go-web-socket/handlers"
+	"github.com/aprbq/go-web-socket/services"
 	"github.com/gorilla/websocket"
 )
 
@@ -31,7 +34,7 @@ type TestConfig struct {
 
 type TestClient struct {
 	conn   *websocket.Conn
-	msgCH  chan *ReqMsg
+	msgCH  chan *services.ReqMsg
 	ctx    context.Context
 	roomID string
 }
@@ -39,7 +42,7 @@ type TestClient struct {
 func NewTestClient(conn *websocket.Conn, ctx context.Context) *TestClient {
 	return &TestClient{
 		conn:  conn,
-		msgCH: make(chan *ReqMsg, 64),
+		msgCH: make(chan *services.ReqMsg, 64),
 		ctx:   ctx,
 	}
 }
@@ -69,7 +72,7 @@ func (c *TestClient) roomMsgLoop(counter1 *atomic.Int64, counter2 *atomic.Int64)
 			if err != nil {
 				return
 			}
-			resp := new(RespMsg)
+			resp := new(services.RespMsg)
 
 			err = json.Unmarshal(b, resp)
 			if err != nil {
@@ -93,8 +96,8 @@ func (c *TestClient) roomMsgLoop(counter1 *atomic.Int64, counter2 *atomic.Int64)
 }
 
 func (c *TestClient) joinRoom(roomID string) {
-	msg := &ReqMsg{
-		MsgType: MsgType_JoinRoom,
+	msg := &services.ReqMsg{
+		MsgType: services.MsgType_JoinRoom,
 		Data:    "wanna join room",
 		RoomID:  roomID,
 	}
@@ -102,8 +105,8 @@ func (c *TestClient) joinRoom(roomID string) {
 }
 
 func (c *TestClient) leaveRoom(roomID string) {
-	msg := &ReqMsg{
-		MsgType: MsgType_LeaveRoom,
+	msg := &services.ReqMsg{
+		MsgType: services.MsgType_LeaveRoom,
 		Data:    "wanna leave room",
 		RoomID:  roomID,
 	}
@@ -111,8 +114,8 @@ func (c *TestClient) leaveRoom(roomID string) {
 }
 
 func (c *TestClient) sendRoomMsg(roomID string) {
-	msg := &ReqMsg{
-		MsgType: MsgType_RoomMsg,
+	msg := &services.ReqMsg{
+		MsgType: services.MsgType_RoomMsg,
 		Data:    "wanna send room message",
 		RoomID:  roomID,
 	}
@@ -122,7 +125,7 @@ func (c *TestClient) sendRoomMsg(roomID string) {
 func joinServer() *websocket.Conn {
 	dialer := websocket.DefaultDialer
 
-	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSPort), nil)
+	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, config.WSPort), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -133,7 +136,7 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 	exit := make(chan struct{})
 	dialer := websocket.DefaultDialer
 
-	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, WSPort), nil)
+	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, config.WSPort), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -170,9 +173,10 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 }
 
 func TestConnection(t *testing.T) {
-	s := NewServer()
+	s := services.NewChatService()
+	h := handlers.NewWSHandler(s)
 
-	go s.createWSServer()
+	go createWSServer(s, h)
 	ctx, cancel := context.WithCancel(context.Background())
 	time.Sleep(1 * time.Second)
 	clientCount := 500
@@ -196,8 +200,8 @@ func TestConnection(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	for range brCount {
-		msg := ReqMsg{
-			MsgType: MsgType_Broadcast,
+		msg := services.ReqMsg{
+			MsgType: services.MsgType_Broadcast,
 			Data:    "hello from tests",
 		}
 		brClient.msgCH <- &msg
@@ -215,8 +219,10 @@ func TestConnection(t *testing.T) {
 // 3. send room msg -> make sure no race && we got correct count
 // 4. leave room -> client count should be 0 in room
 func TestRooms(t *testing.T) {
-	s := NewServer()
-	go s.createWSServer()
+	s := services.NewChatService()
+	h := handlers.NewWSHandler(s)
+
+	go createWSServer(s, h)
 	ctx, cancel := context.WithCancel(context.Background())
 	time.Sleep(1 * time.Second)
 	clientCount := 10
