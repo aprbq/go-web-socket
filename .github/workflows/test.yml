@@ -1,0 +1,16 @@
+name: race-tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # the whole suite runs on in-memory mock repositories — no DB needed
+      - run: make test-chat-race
