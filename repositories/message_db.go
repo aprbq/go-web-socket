@@ -15,16 +15,6 @@ func NewMessageRepositoryDB(db *gorm.DB) MessageRepository {
 	return messageRepositoryDB{db: db}
 }
 
-func (r messageRepositoryDB) SaveMessage(senderID uint, senderName, roomID, data string) error {
-	m := &message{
-		SenderID:   senderID,
-		SenderName: senderName,
-		RoomID:     roomID,
-		Data:       data,
-	}
-	return r.db.Create(m).Error
-}
-
 func (r messageRepositoryDB) SaveDirectMessage(senderID uint, senderName string, recipientID uint, recipientName, data string) error {
 	m := &message{
 		SenderID:      senderID,
@@ -34,20 +24,6 @@ func (r messageRepositoryDB) SaveDirectMessage(senderID uint, senderName string,
 		Data:          data,
 	}
 	return r.db.Create(m).Error
-}
-
-// GetRoomMessages returns the last `limit` messages of the room, oldest first.
-func (r messageRepositoryDB) GetRoomMessages(roomID string, limit int) (msgs []message, err error) {
-	err = r.db.Where("recipient_id = 0 AND room_id = ?", roomID).
-		Order("id DESC").
-		Limit(limit).
-		Find(&msgs).Error
-	if err != nil {
-		return nil, err
-	}
-
-	slices.Reverse(msgs)
-	return msgs, nil
 }
 
 // GetDirectMessages returns the last `limit` messages between the two users, oldest first.
@@ -69,7 +45,7 @@ func (r messageRepositoryDB) GetDirectMessages(userA, userB uint, limit int) (ms
 
 func (r messageRepositoryDB) GetLatestDirectMessages(userID uint) ([]message, error) {
 	all := []message{}
-	err := r.db.Where("recipient_id <> 0 AND (sender_id = ? OR recipient_id = ?)", userID, userID).
+	err := r.db.Where("sender_id = ? OR recipient_id = ?", userID, userID).
 		Order("id DESC").
 		Find(&all).Error
 	if err != nil {

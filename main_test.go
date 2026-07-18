@@ -1,11 +1,8 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"log"
-	"math/rand/v2"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,335 +15,293 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const host = "ws://localhost"
+
+// the whole test binary shares one running server (createWSServer registers on
+// the global http.DefaultServeMux and binds a port, so it can only run once).
 var (
-	host         = "ws://localhost"
-	roomID       = "ROOM_ONE"
-	secondRoomID = "ROOM_TWO"
-	testToken    string
+	testChatSrv services.ChatService
+	testAuthSrv services.AuthService
 )
 
-// newTestServerDeps builds the service/handler graph on mock repositories
-// (no DB needed) and sets testToken used by the dial helpers.
-func newTestServerDeps() (services.ChatService, handlers.WSHandler, handlers.AuthHandler, handlers.HistoryHandler, handlers.UserHandler, handlers.DirectHandler) {
+func TestMain(m *testing.M) {
 	userRepo := repositories.NewUserRepositoryMock()
-	authSrv := services.NewAuthService(userRepo, "test-secret")
-	if _, err := authSrv.Register("tester", "1234"); err != nil {
-		log.Fatal(err)
+	testAuthSrv = services.NewAuthService(userRepo, "test-secret")
+	testChatSrv = services.NewChatService(repositories.NewMessageRepositoryMock(), userRepo)
+
+	wsHdl := handlers.NewWSHandler(testChatSrv, testAuthSrv)
+	authHdl := handlers.NewAuthHandler(testAuthSrv)
+	userHdl := handlers.NewUserHandler(testAuthSrv)
+	directHdl := handlers.NewDirectHandler(testChatSrv, testAuthSrv)
+
+	go createWSServer(testChatSrv, wsHdl, authHdl, userHdl, directHdl)
+	time.Sleep(1 * time.Second) // let the server bind the port
+
+	os.Exit(m.Run())
+}
+
+// registerAndLogin creates a user and returns a valid JWT for it.
+func registerAndLogin(t *testing.T, username string) string {
+	t.Helper()
+	if _, err := testAuthSrv.Register(username, "1234"); err != nil {
+		t.Fatalf("register %s: %v", username, err)
 	}
-	res, err := authSrv.Login("tester", "1234")
+	res, err := testAuthSrv.Login(username, "1234")
 	if err != nil {
-		log.Fatal(err)
+		t.Fatalf("login %s: %v", username, err)
 	}
-	testToken = res.Token
-
-	chatSrv := services.NewChatService(repositories.NewMessageRepositoryMock(), userRepo)
-	return chatSrv,
-		handlers.NewWSHandler(chatSrv, authSrv),
-		handlers.NewAuthHandler(authSrv),
-		handlers.NewHistoryHandler(chatSrv, authSrv),
-		handlers.NewUserHandler(authSrv),
-		handlers.NewDirectHandler(chatSrv, authSrv)
+	return res.Token
 }
 
-func wsURL() string {
-	return fmt.Sprintf("%s%s/ws?token=%s", host, config.WSPort, testToken)
-}
-
-type TestConfig struct {
-	clientCount    int
-	wg             *sync.WaitGroup
-	msgCount       *atomic.Int64
-	msgCountROne   *atomic.Int64
-	msgCountRTwo   *atomic.Int64
-	targetMsgCount int
-}
-
-type TestClient struct {
-	conn   *websocket.Conn
-	msgCH  chan *services.ReqMsg
-	ctx    context.Context
-	roomID string
-}
-
-func NewTestClient(conn *websocket.Conn, ctx context.Context) *TestClient {
-	return &TestClient{
-		conn:  conn,
-		msgCH: make(chan *services.ReqMsg, 64),
-		ctx:   ctx,
-	}
-}
-
-func (c *TestClient) writeLoop() {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case msg := <-c.msgCH:
-			err := c.conn.WriteJSON(&msg)
-			if err != nil {
-				fmt.Printf("error sending msg %v\n", err)
-				return
-			}
-		}
-	}
-}
-
-func (c *TestClient) roomMsgLoop(counter1 *atomic.Int64, counter2 *atomic.Int64) {
-	defer c.conn.Close()
-	exit := make(chan struct{})
-	go func() {
-		defer close(exit)
-		for {
-			_, b, err := c.conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			resp := new(services.RespMsg)
-
-			err = json.Unmarshal(b, resp)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			if resp.RoomID == roomID {
-				counter1.Add(1)
-			} else {
-				counter2.Add(1)
-			}
-		}
-	}()
-
-	select {
-	case <-exit:
-		return
-	case <-c.ctx.Done():
-		return
-	}
-}
-
-func (c *TestClient) joinRoom(roomID string) {
-	msg := &services.ReqMsg{
-		MsgType: services.MsgType_JoinRoom,
-		Data:    "wanna join room",
-		RoomID:  roomID,
-	}
-	c.msgCH <- msg
-}
-
-func (c *TestClient) leaveRoom(roomID string) {
-	msg := &services.ReqMsg{
-		MsgType: services.MsgType_LeaveRoom,
-		Data:    "wanna leave room",
-		RoomID:  roomID,
-	}
-	c.msgCH <- msg
-}
-
-func (c *TestClient) sendRoomMsg(roomID string) {
-	msg := &services.ReqMsg{
-		MsgType: services.MsgType_RoomMsg,
-		Data:    "wanna send room message",
-		RoomID:  roomID,
-	}
-	c.msgCH <- msg
-}
-
-func joinServer() *websocket.Conn {
-	dialer := websocket.DefaultDialer
-
-	conn, _, err := dialer.Dial(wsURL(), nil)
+func dial(t *testing.T, token string) *websocket.Conn {
+	t.Helper()
+	url := fmt.Sprintf("%s%s/ws?token=%s", host, config.WSPort, token)
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
-		log.Fatal(err)
+		t.Fatalf("dial: %v", err)
 	}
 	return conn
 }
 
-func DialServer(tc *TestConfig) *websocket.Conn {
-	exit := make(chan struct{})
-	dialer := websocket.DefaultDialer
-
-	conn, _, err := dialer.Dial(wsURL(), nil)
+// sendDM reports failures with Errorf (not Fatalf) so it is safe to call from
+// sender goroutines the tests spawn; callers should stop sending on false.
+func sendDM(t *testing.T, conn *websocket.Conn, to, data string) bool {
+	t.Helper()
+	err := conn.WriteJSON(map[string]string{
+		"type": string(services.MsgType_DirectMsg),
+		"to":   to,
+		"data": data,
+	})
 	if err != nil {
-		log.Fatal(err)
+		t.Errorf("write to %s: %v", to, err)
+		return false
 	}
-
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			if tc.targetMsgCount == int(tc.msgCount.Load()) {
-				close(exit)
-				return
-			}
-		}
-	}()
-
-	go func() {
-		<-exit
-		conn.Close()
-		tc.wg.Done()
-	}()
-
-	go func() {
-		for {
-			_, b, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-
-			if len(b) > 0 {
-				tc.msgCount.Add(1)
-			}
-		}
-	}()
-	return conn
+	return true
 }
 
-func TestConnection(t *testing.T) {
-	s, h, authHdl, histHdl, userHdl, directHdl := newTestServerDeps()
-
-	go createWSServer(s, h, authHdl, histHdl, userHdl, directHdl)
-	ctx, cancel := context.WithCancel(context.Background())
-	time.Sleep(1 * time.Second)
-	clientCount := 500
-	brCount := 100
-
-	tc := TestConfig{
-		clientCount:    clientCount,
-		wg:             new(sync.WaitGroup),
-		msgCount:       new(atomic.Int64),
-		targetMsgCount: clientCount * brCount,
-	}
-	tc.wg.Add(tc.clientCount + 1)
-
-	brConn := DialServer(&tc)
-	brClient := NewTestClient(brConn, ctx)
-	go brClient.writeLoop()
-
-	for range tc.clientCount {
-		go DialServer(&tc)
-	}
-	time.Sleep(1 * time.Second)
-
-	for range brCount {
-		msg := services.ReqMsg{
-			MsgType: services.MsgType_Broadcast,
-			Data:    "hello from tests",
-		}
-		brClient.msgCH <- &msg
+// TestDirectMessage drives the whole private-chat path: two users connect over
+// websockets, one sends a direct message, and we assert it is delivered to the
+// recipient with the right sender identity and then persisted in history.
+func TestDirectMessage(t *testing.T) {
+	aliceToken := registerAndLogin(t, "alice")
+	bobToken := registerAndLogin(t, "bob")
+	alice, err := testAuthSrv.ValidateToken(aliceToken)
+	if err != nil {
+		t.Fatalf("validate alice token: %v", err)
 	}
 
-	tc.wg.Wait()
-	cancel()
+	aliceConn := dial(t, aliceToken)
+	defer aliceConn.Close()
+	bobConn := dial(t, bobToken)
+	defer bobConn.Close()
+	time.Sleep(200 * time.Millisecond) // let both Join the server
 
-	time.Sleep(1 * time.Second)
-	fmt.Println("exiting test")
+	sendDM(t, aliceConn, "bob", "hi bob")
+
+	// bob receives it with alice as the sender
+	bobConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got := new(services.RespMsg)
+	if err := bobConn.ReadJSON(got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got.SenderName != "alice" || got.Data != "hi bob" || got.To != "bob" {
+		t.Fatalf("unexpected message: %+v", got)
+	}
+
+	// and it is persisted in the conversation history
+	time.Sleep(300 * time.Millisecond) // persist runs in its own goroutine
+	msgs, err := testChatSrv.GetDirectMessages(alice.ID, "bob")
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].SenderName != "alice" || msgs[0].Data != "hi bob" {
+		t.Fatalf("history mismatch: %+v", msgs)
+	}
 }
 
-// 1. join server
-// 2. join room -> we need at least 2
-// 3. send room msg -> make sure no race && we got correct count
-// 4. leave room -> client count should be 0 in room
-func TestRooms(t *testing.T) {
-	s, h, authHdl, histHdl, userHdl, directHdl := newTestServerDeps()
+// TestConcurrentDirectMessages stresses the shared server state under -race:
+// N users are arranged in a ring (user i only ever messages user i+1), every
+// user fires M messages concurrently, and we assert each user receives exactly
+// M messages. Running this under `go test -race` is what surfaces data races on
+// the clients map, the dispatch channels and the persistence goroutines.
+func TestConcurrentDirectMessages(t *testing.T) {
+	const (
+		n = 20 // users
+		m = 50 // messages each user sends -> 1000 messages in flight
+	)
 
-	go createWSServer(s, h, authHdl, histHdl, userHdl, directHdl)
-	ctx, cancel := context.WithCancel(context.Background())
-	time.Sleep(1 * time.Second)
-	clientCount := 10
-	msgCount := 5
+	names := make([]string, n)
+	conns := make([]*websocket.Conn, n)
+	for i := range n {
+		name := fmt.Sprintf("ring%02d", i)
+		names[i] = name
+		conns[i] = dial(t, registerAndLogin(t, name))
+		defer conns[i].Close()
+	}
+	time.Sleep(300 * time.Millisecond) // let every client Join
 
-	tc := TestConfig{
-		clientCount:    clientCount,
-		wg:             new(sync.WaitGroup),
-		msgCountROne:   new(atomic.Int64),
-		msgCountRTwo:   new(atomic.Int64),
-		targetMsgCount: (clientCount - 1) * msgCount,
+	var received atomic.Int64
+	var readers sync.WaitGroup
+	// one reader goroutine per connection, counting delivered messages
+	for i := range n {
+		readers.Add(1)
+		go func(conn *websocket.Conn) {
+			defer readers.Done()
+			for {
+				var msg services.RespMsg
+				if err := conn.ReadJSON(&msg); err != nil {
+					return // connection closed at the end of the test
+				}
+				received.Add(1)
+			}
+		}(conns[i])
 	}
 
-	clientRTwoCount := 0
-	clients := []*TestClient{}
-	for idx := range tc.clientCount {
-		conn := joinServer()
-		c := NewTestClient(conn, ctx)
-		go c.roomMsgLoop(tc.msgCountROne, tc.msgCountRTwo)
-		go c.writeLoop()
+	// every user fires M messages at its ring neighbour, all at once
+	var senders sync.WaitGroup
+	for i := range n {
+		senders.Add(1)
+		go func(i int) {
+			defer senders.Done()
+			to := names[(i+1)%n]
+			for j := range m {
+				if !sendDM(t, conns[i], to, fmt.Sprintf("msg-%d-%d", i, j)) {
+					return
+				}
+			}
+		}(i)
+	}
+	senders.Wait()
 
-		clients = append(clients, c)
-		rID := roomID
-		if rand.IntN(10) < 5 || idx == 0 {
-			rID = secondRoomID
-			clientRTwoCount++
+	// wait until all N*M messages are delivered (or fail on timeout)
+	want := int64(n * m)
+	deadline := time.Now().Add(30 * time.Second)
+	for received.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout: delivered %d/%d messages", received.Load(), want)
 		}
-		c.roomID = rID
-		c.joinRoom(rID)
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	clientROneCount := tc.clientCount - clientRTwoCount
-	expectedMsgCount1 := 0
-	expectedMsgCount2 := 0
+	// closing the connections unblocks the reader goroutines
+	for _, c := range conns {
+		c.Close()
+	}
+	readers.Wait()
 
-	for idx := range msgCount {
-		if clients[idx].roomID == roomID {
-			expectedMsgCount1 += clientROneCount - 1
-		} else {
-			expectedMsgCount2 += clientRTwoCount - 1
+	if got := received.Load(); got != want {
+		t.Fatalf("delivered %d messages, want %d", got, want)
+	}
+}
+
+// TestChurnWhileMessaging hammers the join/leave path at the same time as the
+// deliver path: two stable users message each other while extra tabs of those
+// SAME users keep connecting and disconnecting. Delivery iterates the clients
+// map (recipient tabs + sender's other tabs) while join/leave mutates it —
+// exactly the interleaving where a data race would surface under -race if the
+// AcceptLoop didn't own all of that state.
+func TestChurnWhileMessaging(t *testing.T) {
+	const (
+		msgs     = 80 // messages each stable user sends
+		churners = 6  // tabs that keep connecting/disconnecting
+	)
+
+	tokenA := registerAndLogin(t, "stableA")
+	tokenB := registerAndLogin(t, "stableB")
+
+	connA := dial(t, tokenA)
+	defer connA.Close()
+	connB := dial(t, tokenB)
+	defer connB.Close()
+	time.Sleep(200 * time.Millisecond) // let both Join the server
+
+	// stable readers count only what the peer sent them
+	var gotA, gotB atomic.Int64
+	var readers sync.WaitGroup
+	readCounted := func(conn *websocket.Conn, from string, counter *atomic.Int64) {
+		defer readers.Done()
+		for {
+			msg := new(services.RespMsg)
+			if err := conn.ReadJSON(msg); err != nil {
+				return // connection closed at the end of the test
+			}
+			if msg.SenderName == from {
+				counter.Add(1)
+			}
 		}
 	}
+	readers.Add(2)
+	go readCounted(connA, "stableB", &gotA)
+	go readCounted(connB, "stableA", &gotB)
 
-	for {
-		time.Sleep(1 * time.Second)
-		tr1 := s.GetRoomTestResults(roomID)
-		tr2 := s.GetRoomTestResults(secondRoomID)
-		fmt.Printf("curr client count = %d targer = %d\n", tr1.ClientsCount, clientROneCount)
-		fmt.Printf("curr client count = %d targer = %d\n", tr2.ClientsCount, clientRTwoCount)
+	// churners: extra tabs of stableA/stableB joining and leaving nonstop
+	stopChurn := make(chan struct{})
+	var churn sync.WaitGroup
+	for i := range churners {
+		churn.Add(1)
+		go func(i int) {
+			defer churn.Done()
+			token := tokenA
+			if i%2 == 0 {
+				token = tokenB
+			}
+			url := fmt.Sprintf("%s%s/ws?token=%s", host, config.WSPort, token)
+			for {
+				select {
+				case <-stopChurn:
+					return
+				default:
+				}
+				conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+				if err != nil {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				// stay online briefly, drain whatever gets delivered, then leave
+				conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						break
+					}
+				}
+				conn.Close()
+			}
+		}(i)
+	}
 
-		if tr1.ClientsCount == clientROneCount && tr2.ClientsCount == clientRTwoCount {
-			fmt.Println("exiting clientCount JoinLoop")
-			break
+	// both stable users fire messages while the churn is running; the tiny
+	// sleep stretches the send window so many join/leave cycles overlap it
+	var senders sync.WaitGroup
+	send := func(conn *websocket.Conn, to, prefix string) {
+		defer senders.Done()
+		for j := range msgs {
+			if !sendDM(t, conn, to, fmt.Sprintf("%s-%d", prefix, j)) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	senders.Add(2)
+	go send(connA, "stableB", "a")
+	go send(connB, "stableA", "b")
+	senders.Wait()
 
-	for idx := range msgCount {
-		sender := clients[idx]
-		sender.sendRoomMsg(sender.roomID)
-	}
-
-	for {
-		time.Sleep(1 * time.Second)
-		currCount1 := tc.msgCountROne.Load()
-		currCount2 := tc.msgCountRTwo.Load()
-		fmt.Printf("curr msg count = %d targer = %d\n", currCount1, expectedMsgCount1)
-		fmt.Printf("curr msg count = %d targer = %d\n", currCount2, expectedMsgCount2)
-
-		if currCount1 == int64(expectedMsgCount1) && currCount2 == int64(expectedMsgCount2) {
-			break
+	// every stable message must arrive despite the churn
+	deadline := time.Now().Add(20 * time.Second)
+	for gotA.Load() < msgs || gotB.Load() < msgs {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout: A got %d/%d, B got %d/%d", gotA.Load(), msgs, gotB.Load(), msgs)
 		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	for _, c := range clients {
-		go c.leaveRoom(c.roomID)
+	close(stopChurn)
+	churn.Wait()
+	connA.Close()
+	connB.Close()
+	readers.Wait()
+
+	if gotA.Load() != msgs || gotB.Load() != msgs {
+		t.Fatalf("A got %d, B got %d, want %d each", gotA.Load(), gotB.Load(), msgs)
 	}
-
-	for {
-		time.Sleep(1 * time.Second)
-		tr := s.GetRoomTestResults(roomID)
-		fmt.Println("curr client count = ", tr.ClientsCount)
-		if tr.ClientsCount == 0 {
-			fmt.Println("exiting clientCount LeaveLoop")
-			break
-		}
-	}
-
-	cancel()
-
-	for {
-		time.Sleep(1 * time.Second)
-		clientCount := s.GetServerTestResults()
-		fmt.Println("client count = ", clientCount)
-		if clientCount == 0 {
-			break
-		}
-	}
-
-	fmt.Println("exiting test")
 }
