@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: go-websocket-db
+    environment:
+      POSTGRES_USER: chat
+      POSTGRES_PASSWORD: chatpass
+      POSTGRES_DB: chatdb
+    ports:
+      # 5433 on the host — 5432 is taken by a locally installed PostgreSQL
+      - "5433:5432"
+    volumes:
+      - chat_pgdata:/var/lib/postgresql/data
+
+volumes:
+  chat_pgdata:

@@ -13,6 +13,7 @@ import (
 
 	"github.com/aprbq/go-web-socket/config"
 	"github.com/aprbq/go-web-socket/handlers"
+	"github.com/aprbq/go-web-socket/repositories"
 	"github.com/aprbq/go-web-socket/services"
 	"github.com/gorilla/websocket"
 )
@@ -21,7 +22,35 @@ var (
 	host         = "ws://localhost"
 	roomID       = "ROOM_ONE"
 	secondRoomID = "ROOM_TWO"
+	testToken    string
 )
+
+// newTestServerDeps builds the service/handler graph on mock repositories
+// (no DB needed) and sets testToken used by the dial helpers.
+func newTestServerDeps() (services.ChatService, handlers.WSHandler, handlers.AuthHandler, handlers.HistoryHandler, handlers.UserHandler, handlers.DirectHandler) {
+	userRepo := repositories.NewUserRepositoryMock()
+	authSrv := services.NewAuthService(userRepo, "test-secret")
+	if _, err := authSrv.Register("tester", "1234"); err != nil {
+		log.Fatal(err)
+	}
+	res, err := authSrv.Login("tester", "1234")
+	if err != nil {
+		log.Fatal(err)
+	}
+	testToken = res.Token
+
+	chatSrv := services.NewChatService(repositories.NewMessageRepositoryMock(), userRepo)
+	return chatSrv,
+		handlers.NewWSHandler(chatSrv, authSrv),
+		handlers.NewAuthHandler(authSrv),
+		handlers.NewHistoryHandler(chatSrv, authSrv),
+		handlers.NewUserHandler(authSrv),
+		handlers.NewDirectHandler(chatSrv, authSrv)
+}
+
+func wsURL() string {
+	return fmt.Sprintf("%s%s/ws?token=%s", host, config.WSPort, testToken)
+}
 
 type TestConfig struct {
 	clientCount    int
@@ -125,7 +154,7 @@ func (c *TestClient) sendRoomMsg(roomID string) {
 func joinServer() *websocket.Conn {
 	dialer := websocket.DefaultDialer
 
-	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, config.WSPort), nil)
+	conn, _, err := dialer.Dial(wsURL(), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -136,7 +165,7 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 	exit := make(chan struct{})
 	dialer := websocket.DefaultDialer
 
-	conn, _, err := dialer.Dial(fmt.Sprintf("%s%s", host, config.WSPort), nil)
+	conn, _, err := dialer.Dial(wsURL(), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -173,10 +202,9 @@ func DialServer(tc *TestConfig) *websocket.Conn {
 }
 
 func TestConnection(t *testing.T) {
-	s := services.NewChatService()
-	h := handlers.NewWSHandler(s)
+	s, h, authHdl, histHdl, userHdl, directHdl := newTestServerDeps()
 
-	go createWSServer(s, h)
+	go createWSServer(s, h, authHdl, histHdl, userHdl, directHdl)
 	ctx, cancel := context.WithCancel(context.Background())
 	time.Sleep(1 * time.Second)
 	clientCount := 500
@@ -219,10 +247,9 @@ func TestConnection(t *testing.T) {
 // 3. send room msg -> make sure no race && we got correct count
 // 4. leave room -> client count should be 0 in room
 func TestRooms(t *testing.T) {
-	s := services.NewChatService()
-	h := handlers.NewWSHandler(s)
+	s, h, authHdl, histHdl, userHdl, directHdl := newTestServerDeps()
 
-	go createWSServer(s, h)
+	go createWSServer(s, h, authHdl, histHdl, userHdl, directHdl)
 	ctx, cancel := context.WithCancel(context.Background())
 	time.Sleep(1 * time.Second)
 	clientCount := 10
