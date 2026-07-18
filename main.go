@@ -40,7 +40,6 @@ func createWSServer(
 	chatSrv services.ChatService,
 	wsHandler handlers.WSHandler,
 	authHandler handlers.AuthHandler,
-	historyHandler handlers.HistoryHandler,
 	userHandler handlers.UserHandler,
 	directHandler handlers.DirectHandler,
 ) {
@@ -48,7 +47,6 @@ func createWSServer(
 
 	handleREST("POST /register", authHandler.Register)
 	handleREST("POST /login", authHandler.Login)
-	handleREST("GET /history", historyHandler.GetRoomMessages)
 	handleREST("GET /users", userHandler.SearchUsers)
 	handleREST("GET /dm/history", directHandler.GetHistory)
 	handleREST("GET /dm/conversations", directHandler.GetConversations)
@@ -74,10 +72,9 @@ func main() {
 	chatSrv := services.NewChatService(msgRepo, userRepo)
 
 	authHandler := handlers.NewAuthHandler(authSrv)
-	historyHandler := handlers.NewHistoryHandler(chatSrv, authSrv)
 	userHandler := handlers.NewUserHandler(authSrv)
 	directHandler := handlers.NewDirectHandler(chatSrv, authSrv)
 	wsHandler := handlers.NewWSHandler(chatSrv, authSrv)
 
-	createWSServer(chatSrv, wsHandler, authHandler, historyHandler, userHandler, directHandler)
+	createWSServer(chatSrv, wsHandler, authHandler, userHandler, directHandler)
 }

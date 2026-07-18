@@ -1,4 +1,4 @@
-.PHONY: chat test-chat test-chat-race test-rooms-race db-up db-down db-reset db-shell db-users db-messages
+.PHONY: chat test-chat test-chat-race db-up db-down db-reset db-shell db-users db-messages
 
 # ---------- app ----------
 chat:
@@ -38,8 +38,3 @@ test-chat-race:
 	@echo "Running the tests with race detector..."
 	@go clean -testcache
 	@go test -race -v ./...
-
-test-rooms-race:
-	@echo "Running the rooms tests with race detector..."
-	@go clean -testcache
-	@go test -race -v -timeout 30s -run TestRooms .

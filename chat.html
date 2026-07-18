@@ -507,7 +507,7 @@
         return;
       }
 
-      const TEN_MINUTE_LIMIT = 10 * 60 * 1000;
+      const TEN_MINUTE_LIMIT = 1 * 60 * 1000;
       if (!lastMsgTime || (dateObj.getTime() - lastMsgTime.getTime() > TEN_MINUTE_LIMIT)) {
         const divider = document.createElement("div");
         divider.className = "time-divider";
